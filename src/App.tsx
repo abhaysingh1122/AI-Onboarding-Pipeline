@@ -63,7 +63,7 @@ const App = () => {
             videoRef={videoRef}
             connectionState={connectionState}
             isAvatarSpeaking={isAvatarSpeaking}
-            onStartSession={() => connect()}
+            onStartSession={(email) => connect({ email })}
             isConfigured={isConfigured}
             currentCaption={currentCaption}
             onPreAcquireMic={preAcquireMic}
