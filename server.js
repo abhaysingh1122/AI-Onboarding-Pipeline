@@ -88,6 +88,7 @@ app.post("/api/callback", async (req, res) => {
       persona_id:       PERSONA_ID,
       replica_id:       props.replica_id || REPLICA_ID,
       conversation_url: cached.conversation_url || null,
+      client_email:     cached.client_email || null,
       status:           "ended",
       shutdown_reason:  cached.shutdown_reason || null,
       created_at:       cached.created_at || null,
@@ -122,6 +123,11 @@ app.post("/api/conversations", async (req, res) => {
 
     const body = { ...req.body };
 
+    // Extract custom field before forwarding to Tavus (Tavus doesn't know about it)
+    const clientEmail = body.client_email || null;
+    delete body.client_email;
+    if (clientEmail) console.log(`[Proxy] Client email: ${clientEmail}`);
+
     const proto   = req.headers["x-forwarded-proto"] || "https";
     const host    = req.headers["x-forwarded-host"]  || req.headers.host || "";
     const selfUrl = host ? `${proto}://${host}` : "";
@@ -151,6 +157,7 @@ app.post("/api/conversations", async (req, res) => {
         conversationCache.set(data.conversation_id, {
           conversation_url: data.conversation_url || null,
           created_at: new Date().toISOString(),
+          client_email: clientEmail || null,
         });
       }
     }
