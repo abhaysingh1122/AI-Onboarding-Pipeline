@@ -11,7 +11,7 @@ interface AvatarStageProps {
   videoRef: RefObject<HTMLVideoElement | null>;
   connectionState: ConnectionState;
   isAvatarSpeaking: boolean;
-  onStartSession?: () => void;
+  onStartSession?: (email: string) => void;
   isConfigured?: boolean;
   currentCaption?: string;
   onPreAcquireMic?: () => void;
@@ -76,7 +76,7 @@ const AvatarStage = ({ videoRef, connectionState, isAvatarSpeaking, onStartSessi
       style={{ boxShadow: glowStyles[connectionState] }}
     >
       {connectionState === "idle" && (
-        <WelcomeBriefing onBegin={onStartSession!} isConfigured={isConfigured ?? true} onHoverBegin={onPreAcquireMic} hasRestarted={hasRestarted} />
+        <WelcomeBriefing onBegin={(email) => onStartSession!(email)} isConfigured={isConfigured ?? true} onHoverBegin={onPreAcquireMic} hasRestarted={hasRestarted} />
       )}
       {connectionState === "disconnected" && (
         <div className="flex flex-col items-center gap-4 px-4 sm:px-6 text-center">
