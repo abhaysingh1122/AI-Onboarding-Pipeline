@@ -15,7 +15,7 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 const PERSONA_ID      = process.env.VITE_TAVUS_PERSONA_ID || "";
 const REPLICA_ID      = process.env.VITE_TAVUS_REPLICA_ID || "";
 
-// conversation_id → { conversation_url, created_at }
+// conversation_id → { conversation_url, created_at, shutdown_reason }
 const conversationCache = new Map();
 
 if (!TAVUS_API_KEY) {
@@ -40,28 +40,35 @@ app.get("/health", (_req, res) => {
 
 // ─── Tavus callback receiver ──────────────────────────────────────────────────
 //
-// Tavus sends callbacks with event_type:
-//   • system.replica_joined        → session started
-//   • system.shutdown              → room closed
-//   • application.transcription_ready → transcript is ready (POST-conversation)
-//   • application.recording_ready  → recording available
-//   • application.perception_analysis → visual summary
-//
-// We ONLY forward to n8n on "application.transcription_ready"
-// — it fires once, after the chat ends, and includes the full transcript.
+// Tavus event_type values:
+//   • system.replica_joined          → ignored
+//   • system.shutdown                → cache shutdown_reason for later
+//   • application.transcription_ready → fire n8n (with transcript + shutdown_reason)
+//   • application.recording_ready    → ignored
+//   • application.perception_analysis → ignored
 //
 app.post("/api/callback", async (req, res) => {
   try {
     const data      = req.body;
     const eventType = data.event_type || "";
     const convId    = data.conversation_id || "unknown";
+    const props     = data.properties || {};
 
     console.log(`[Callback] ${convId} → event_type="${eventType}"`);
-    console.log(`[Callback] Full body:`, JSON.stringify(data));
 
-    // ── Only fire n8n when the transcript is ready ──
+    // ── system.shutdown: cache the shutdown_reason for when transcript arrives ──
+    if (eventType === "system.shutdown") {
+      const reason = props.shutdown_reason || null;
+      console.log(`[Callback] Caching shutdown_reason="${reason}" for ${convId}`);
+      const cached = conversationCache.get(convId) || {};
+      cached.shutdown_reason = reason;
+      conversationCache.set(convId, cached);
+      return res.sendStatus(200);
+    }
+
+    // ── Only fire n8n on transcription_ready ──
     if (eventType !== "application.transcription_ready") {
-      console.log(`[Callback] Ignoring "${eventType}" — waiting for transcription_ready`);
+      console.log(`[Callback] Ignoring "${eventType}"`);
       return res.sendStatus(200);
     }
 
@@ -70,9 +77,11 @@ app.post("/api/callback", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const cached     = conversationCache.get(convId) || {};
-    const props      = data.properties || {};
-    const transcript = props.transcript || [];
+    const cached    = conversationCache.get(convId) || {};
+    const rawTranscript = props.transcript || [];
+
+    // Filter out system messages — only keep assistant and user
+    const transcript = rawTranscript.filter((msg) => msg.role !== "system");
 
     const payload = {
       conversation_id:  convId,
@@ -80,8 +89,9 @@ app.post("/api/callback", async (req, res) => {
       replica_id:       props.replica_id || REPLICA_ID,
       conversation_url: cached.conversation_url || null,
       status:           "ended",
-      ended_at:         data.timestamp || new Date().toISOString(),
+      shutdown_reason:  cached.shutdown_reason || null,
       created_at:       cached.created_at || null,
+      ended_at:         data.timestamp || new Date().toISOString(),
       transcript:       transcript,
     };
 
@@ -95,7 +105,7 @@ app.post("/api/callback", async (req, res) => {
     });
     console.log("[n8n] Response status:", n8nRes.status);
 
-    // Cleanup cache
+    // Cleanup
     conversationCache.delete(convId);
 
     res.sendStatus(200);
