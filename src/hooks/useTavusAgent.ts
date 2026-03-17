@@ -22,6 +22,7 @@ const HIGH_QUALITY_RECEIVE: DailyReceiveSettings = {
 
 interface ConnectOptions {
   fromRestart?: boolean;
+  email?: string;
 }
 
 export function useTavusAgent(
@@ -400,6 +401,8 @@ export function useTavusAgent(
               participant_left_timeout: 120,
               participant_absent_timeout: 120,
             },
+            // Custom field — server caches this and includes in n8n webhook
+            client_email: options?.email || undefined,
           }),
         });
 
