@@ -15,9 +15,9 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
 const PERSONA_ID      = process.env.VITE_TAVUS_PERSONA_ID || "";
 const REPLICA_ID      = process.env.VITE_TAVUS_REPLICA_ID || "";
 
-// In-memory store: conversation_id → { conversation_url, created_at }
-// Used so the end-session handler can include conversation_url in the n8n payload
-const conversationCache = new Map();
+// In-memory caches
+const conversationCache = new Map();  // conversation_id → { conversation_url, created_at }
+const firedSet          = new Set();  // conversation_ids already sent to n8n (dedup)
 
 if (!TAVUS_API_KEY) {
   console.error("[Server] FATAL: TAVUS_API_KEY is not set — exiting");
@@ -25,16 +25,23 @@ if (!TAVUS_API_KEY) {
 }
 
 console.log("[Server] TAVUS_API_KEY:", TAVUS_API_KEY ? "✓ set" : "✗ MISSING");
-console.log("[Server] N8N_WEBHOOK_URL:", N8N_WEBHOOK_URL || "✗ NOT SET — n8n firing will be skipped");
+console.log("[Server] N8N_WEBHOOK_URL:", N8N_WEBHOOK_URL || "✗ NOT SET");
 console.log("[Server] PERSONA_ID:", PERSONA_ID || "(not set)");
 console.log("[Server] REPLICA_ID:", REPLICA_ID || "(not set)");
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-async function fireN8n(payload) {
+// ─── Helper: fire n8n exactly once per conversation ──────────────────────────
+async function fireN8nOnce(conversationId, payload) {
   if (!N8N_WEBHOOK_URL) {
     console.warn("[n8n] N8N_WEBHOOK_URL not set — skipping");
     return;
   }
+  if (firedSet.has(conversationId)) {
+    console.log(`[n8n] Already fired for ${conversationId} — skipping duplicate`);
+    return;
+  }
+
+  firedSet.add(conversationId);
+
   try {
     console.log("[n8n] Firing webhook →", N8N_WEBHOOK_URL);
     console.log("[n8n] Payload:", JSON.stringify(payload, null, 2));
@@ -45,8 +52,16 @@ async function fireN8n(payload) {
     });
     console.log("[n8n] Response status:", res.status);
   } catch (err) {
-    console.error("[n8n] Failed to fire webhook:", err.message);
+    console.error("[n8n] Failed:", err.message);
+    // Remove from firedSet so it can retry on next callback
+    firedSet.delete(conversationId);
   }
+
+  // Clean up dedup set after 10 min (prevent memory leak on long-running server)
+  setTimeout(() => {
+    firedSet.delete(conversationId);
+    conversationCache.delete(conversationId);
+  }, 10 * 60 * 1000);
 }
 
 // ─── Health check ─────────────────────────────────────────────────────────────
@@ -60,27 +75,34 @@ app.get("/health", (_req, res) => {
 });
 
 // ─── Tavus callback receiver ──────────────────────────────────────────────────
-// Tavus POSTs here when a conversation ends (if callback_url was set).
-// This is a secondary mechanism — primary is firing directly from /end endpoint.
+// Tavus POSTs here on EVERY status change (joined, ended, disconnected, etc).
+// We ONLY forward to n8n when status is "ended" — one time per conversation.
 app.post("/api/callback", async (req, res) => {
   try {
-    console.log("[Callback] Received Tavus event:", JSON.stringify(req.body));
     const tavusData = req.body;
+    const status = tavusData.status || "";
+    const convId = tavusData.conversation_id || "unknown";
 
-    const cached = conversationCache.get(tavusData.conversation_id) || {};
+    console.log(`[Callback] Event for ${convId}: status="${status}"`);
 
-    await fireN8n({
-      source:           "tavus_callback",
-      conversation_id:  tavusData.conversation_id  || null,
+    // ── Only fire n8n when the conversation has truly ended ──
+    if (status !== "ended") {
+      console.log(`[Callback] Ignoring non-end status "${status}" — not forwarding`);
+      return res.sendStatus(200);
+    }
+
+    const cached = conversationCache.get(convId) || {};
+
+    await fireN8nOnce(convId, {
+      conversation_id:  convId,
       persona_id:       PERSONA_ID,
       replica_id:       REPLICA_ID,
       conversation_url: tavusData.conversation_url || cached.conversation_url || null,
-      status:           tavusData.status           || null,
+      status:           "ended",
       shutdown_reason:  tavusData.shutdown_reason  || null,
       created_at:       tavusData.created_at       || cached.created_at       || null,
       ended_at:         tavusData.ended_at         || new Date().toISOString(),
-      transcript:       tavusData.transcript        || [],
-      raw:              tavusData,
+      transcript:       tavusData.transcript       || [],
     });
 
     res.sendStatus(200);
@@ -97,10 +119,9 @@ app.post("/api/conversations", async (req, res) => {
 
     const body = { ...req.body };
 
-    // Derive our own public URL from the incoming request to set callback_url
-    // This works even if RAILWAY_PUBLIC_DOMAIN isn't set as an env var
-    const proto = req.headers["x-forwarded-proto"] || "https";
-    const host  = req.headers["x-forwarded-host"] || req.headers.host || "";
+    // Derive public URL from request headers to set callback_url
+    const proto   = req.headers["x-forwarded-proto"] || "https";
+    const host    = req.headers["x-forwarded-host"]  || req.headers.host || "";
     const selfUrl = host ? `${proto}://${host}` : "";
 
     if (selfUrl) {
@@ -126,7 +147,6 @@ app.post("/api/conversations", async (req, res) => {
       console.error(`[Proxy] Tavus create failed (${response.status}):`, text);
     } else {
       console.log(`[Proxy] Conversation created — id: ${data.conversation_id}, url: ${data.conversation_url}`);
-      // Cache for use in end-session handler
       if (data.conversation_id) {
         conversationCache.set(data.conversation_id, {
           conversation_url: data.conversation_url || null,
@@ -143,8 +163,8 @@ app.post("/api/conversations", async (req, res) => {
 });
 
 // ─── End conversation ─────────────────────────────────────────────────────────
-// PRIMARY webhook trigger — fires n8n immediately when session ends,
-// no dependency on Tavus callback system.
+// Just proxies to Tavus. Does NOT fire n8n here.
+// The Tavus callback with status="ended" handles the webhook (with transcript).
 app.post("/api/conversations/:id/end", async (req, res) => {
   const convId = req.params.id;
   console.log(`[Proxy] POST /api/conversations/${convId}/end`);
@@ -158,25 +178,6 @@ app.post("/api/conversations/:id/end", async (req, res) => {
     const text = await response.text();
     const data = text ? JSON.parse(text) : { ok: true };
     console.log(`[Proxy] Tavus end returned ${response.status}`);
-
-    // ── Fire n8n immediately (don't wait for Tavus callback) ──
-    const cached = conversationCache.get(convId) || {};
-    await fireN8n({
-      source:           "session_end",
-      conversation_id:  convId,
-      persona_id:       PERSONA_ID,
-      replica_id:       REPLICA_ID,
-      conversation_url: cached.conversation_url || null,
-      status:           "ended",
-      shutdown_reason:  data.shutdown_reason    || "user_ended",
-      created_at:       cached.created_at       || null,
-      ended_at:         new Date().toISOString(),
-      transcript:       data.transcript          || [],
-      raw:              data,
-    });
-
-    // Cleanup cache
-    conversationCache.delete(convId);
 
     res.status(response.status).json(data);
   } catch (err) {
