@@ -84,6 +84,7 @@ app.post("/api/callback", async (req, res) => {
     const transcript = rawTranscript.filter((msg) => msg.role !== "system");
 
     const payload = {
+      action:           "get_onboarding_session",
       conversation_id:  convId,
       persona_id:       PERSONA_ID,
       replica_id:       props.replica_id || REPLICA_ID,
